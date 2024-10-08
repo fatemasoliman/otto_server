@@ -1,161 +1,324 @@
+require('dotenv').config();
+
 const express = require('express');
-const cors = require('cors');
-const http = require('http');
-const WebSocket = require('ws');
+const bodyParser = require('body-parser');
 const AWS = require('aws-sdk');
+const cors = require('cors');
+const fs = require('fs');
+const util = require('util');
+const OpenAI = require('openai');
+const mysql = require('mysql2/promise');
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// Set up logging
+const log_file = fs.createWriteStream('/home/ec2-user/ottoq-app/debug.log', {flags : 'a'});
+const log_stdout = process.stdout;
+
+console.log = function(d) {
+  const message = typeof d === 'object' ? JSON.stringify(d) : d;
+  log_file.write(util.format(message) + '\n');
+  log_stdout.write(util.format(message) + '\n');
+};
 
 const app = express();
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+const port = 8080;
 
-const port = process.env.PORT || 8080;
+// Add this near the top of your server.js file, after creating the app
+app.use((req, res, next) => {
+  console.log(`Received ${req.method} request to ${req.path}`);
+  next();
+});
+
+// Configure AWS (no explicit credentials)
+AWS.config.update({ region: process.env.AWS_REGION });
+
+const dynamoDB = new AWS.DynamoDB.DocumentClient();
 
 app.use(cors());
-app.use(express.json());
+app.use(bodyParser.json());
 
-// Configure AWS
-AWS.config.update({ region: 'eu-north-1' });
+// Create a MySQL connection pool
+const pool = mysql.createPool({
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0
+});
 
-// DynamoDB client
-const dynamodb = new AWS.DynamoDB.DocumentClient();
-const dynamodbClient = new AWS.DynamoDB(); // Add this line for the DynamoDB client
-
-// DynamoDB table name
-const TABLE_NAME = 'email_queue';
-
-// Function to check if the table exists and is accessible
-async function checkTable() {
-  const params = {
-    TableName: TABLE_NAME
-  };
-
+// Check if the table exists
+async function checkTableExists() {
   try {
-    const data = await dynamodbClient.describeTable(params).promise();
-    console.log("Table exists and is accessible:", data.Table.TableName);
-    return true;
+    const params = {
+      TableName: 'email_queue'
+    };
+    await dynamoDB.scan(params).promise();
+    console.log('Table exists and is accessible: email_queue');
   } catch (error) {
-    if (error.code === 'ResourceNotFoundException') {
-      console.error("Table does not exist:", TABLE_NAME);
-    } else {
-      console.error("Error checking table:", error);
-    }
-    return false;
+    console.error('Error checking table:', error);
   }
 }
 
-app.get('/', (req, res) => {
-  console.log('Handling GET request on /');
-  res.send('Hello from OttoFill server!');
-});
-
-// GET route to fetch all emails
+// Define the /email GET route
 app.get('/email', async (req, res) => {
-  console.log('Received GET request to fetch all emails');
-  try {
-    const params = {
-      TableName: TABLE_NAME,
-    };
-    const result = await dynamodb.scan(params).promise();
-    const emails = result.Items;
-    res.status(200).json(emails);
-  } catch (error) {
-    console.error('Error fetching emails:', error);
-    res.status(500).send('Error fetching emails');
+  console.log('Received GET request to /email');
+  console.log('Auth token:', req.headers.authorization);
+  console.log('User email:', req.headers['user-email']);
+
+  const userEmail = req.headers['user-email'];
+
+  if (!userEmail) {
+    console.error('No user email provided in request headers');
+    return res.status(400).json({ error: 'User email is required' });
   }
-});
 
-// POST route to add a new email
-app.post('/email', async (req, res) => {
-  console.log('Received request:', req.body);
-  const { 
-    emailTimestamp, 
-    body, 
-    sender, 
-    subject, 
-    user, 
-    status 
-  } = req.body;
-
-  const newEmail = {
-    emailTimestamp,
-    body,
-    sender,
-    subject,
-    user,
-    status,
-    timestampAddedToQueue: new Date().toISOString()
-  };
-  
   try {
     const params = {
-      TableName: TABLE_NAME,
-      Item: newEmail
-    };
-    await dynamodb.put(params).promise();
-    console.log('Received new email:', newEmail);
-    res.status(200).send('Email received');
-
-    // Notify all connected WebSocket clients about the new email
-    wss.clients.forEach((client) => {
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(JSON.stringify({ type: 'newEmail', email: newEmail }));
+      TableName: 'email_queue',
+      FilterExpression: '(attribute_not_exists(#status) OR (#status <> :clearedStatus AND #status <> :completedStatus)) AND #user = :userEmail',
+      ExpressionAttributeNames: {
+        '#status': 'status',
+        '#user': 'user'
+      },
+      ExpressionAttributeValues: {
+        ':clearedStatus': 'Cleared',
+        ':completedStatus': 'Completed',
+        ':userEmail': userEmail
       }
-    });
+    };
+
+    console.log('DynamoDB params:', JSON.stringify(params));
+
+    const data = await dynamoDB.scan(params).promise();
+    console.log('DynamoDB response:', JSON.stringify(data));
+
+    console.log('Emails retrieved successfully');
+    const emails = data.Items.map(item => ({
+      id: item.id,
+      subject: item.subject,
+      from: item.from,
+      timestamp: item.timestamp,
+      messageId: item.messageId,
+      user: item.user,
+      status: item.status // Include status in the response
+    }));
+    console.log('Sample email:', emails[0]);
+    res.json(emails);
   } catch (error) {
-    console.error('Error saving email:', error);
-    res.status(500).send('Error saving email');
+    console.error('Error retrieving emails from DynamoDB:', error);
+    res.status(500).json({ error: 'Error retrieving emails', details: error.message, stack: error.stack });
   }
 });
 
-wss.on('connection', (ws) => {
-  console.log('New WebSocket connection');
+// Update the /email/:id/done route
+app.post('/email/:id/done', async (req, res) => {
+    console.log('Received POST request to mark email as done:', req.params.id);
 
-  ws.on('message', async (message) => {
-    const data = JSON.parse(message);
-    console.log('Received:', data);
-
-    if (data.type === 'getEmails') {
-      try {
-        const params = {
-          TableName: TABLE_NAME,
+    try {
+        // First, find the item with the given id
+        const findParams = {
+            TableName: 'email_queue',
+            FilterExpression: 'id = :id',
+            ExpressionAttributeValues: {
+                ':id': req.params.id
+            }
         };
-        const result = await dynamodb.scan(params).promise();
-        const emails = result.Items;
-        ws.send(JSON.stringify({ type: 'emails', emails: emails }));
-      } catch (error) {
-        console.error('Error fetching emails:', error);
-        ws.send(JSON.stringify({ type: 'error', message: 'Error fetching emails' }));
-      }
-    }
-  });
 
-  ws.on('close', () => {
-    console.log('WebSocket connection closed');
-  });
+        console.log('Finding email with params:', JSON.stringify(findParams));
+        const findResult = await dynamoDB.scan(findParams).promise();
+        console.log('Find result:', JSON.stringify(findResult));
+        
+        if (findResult.Items.length === 0) {
+            console.log('Email not found');
+            return res.status(404).json({ error: 'Email not found', id: req.params.id });
+        }
+
+        const item = findResult.Items[0];
+        console.log('Found email:', JSON.stringify(item));
+
+        // Now update the item using the emailTimestamp as the primary key
+        const updateParams = {
+            TableName: 'email_queue',
+            Key: {
+                emailTimestamp: item.emailTimestamp
+            },
+            UpdateExpression: 'set #status = :status',
+            ExpressionAttributeNames: {
+                '#status': 'status'
+            },
+            ExpressionAttributeValues: {
+                ':status': 'Completed'
+            },
+            ReturnValues: 'ALL_NEW'
+        };
+
+        console.log('Updating email with params:', JSON.stringify(updateParams));
+        const data = await dynamoDB.update(updateParams).promise();
+        console.log('Email marked as done successfully:', JSON.stringify(data.Attributes));
+        res.status(200).json({ message: 'Email marked as done successfully', email: data.Attributes });
+    } catch (error) {
+        console.error('Error marking email as done in DynamoDB:', error);
+        res.status(500).json({ error: 'Error marking email as done', details: error.message, stack: error.stack });
+    }
 });
 
-// Modify the server startup
-async function startServer() {
-  const tableExists = await checkTable();
-  if (!tableExists) {
-    console.error("Table does not exist or is not accessible. Please create the table before starting the server.");
-    process.exit(1);
-  }
+// Update the /email/:id/clear route similarly
+app.post('/email/:id/clear', async (req, res) => {
+    console.log('Received POST request to clear email:', req.params.id);
 
-  server.listen(port, '0.0.0.0', () => {
+    try {
+        // First, find the item with the given id
+        const findParams = {
+            TableName: 'email_queue',
+            FilterExpression: 'id = :id',
+            ExpressionAttributeValues: {
+                ':id': req.params.id
+            }
+        };
+
+        console.log('Finding email with params:', JSON.stringify(findParams));
+        const findResult = await dynamoDB.scan(findParams).promise();
+        console.log('Find result:', JSON.stringify(findResult));
+        
+        if (findResult.Items.length === 0) {
+            console.log('Email not found');
+            return res.status(404).json({ error: 'Email not found', id: req.params.id });
+        }
+
+        const item = findResult.Items[0];
+        console.log('Found email:', JSON.stringify(item));
+
+        // Now update the item using the emailTimestamp as the primary key
+        const updateParams = {
+            TableName: 'email_queue',
+            Key: {
+                emailTimestamp: item.emailTimestamp
+            },
+            UpdateExpression: 'set #status = :status',
+            ExpressionAttributeNames: {
+                '#status': 'status'
+            },
+            ExpressionAttributeValues: {
+                ':status': 'Cleared'
+            },
+            ReturnValues: 'ALL_NEW'
+        };
+
+        console.log('Updating email with params:', JSON.stringify(updateParams));
+        const data = await dynamoDB.update(updateParams).promise();
+        console.log('Email cleared successfully:', JSON.stringify(data.Attributes));
+        res.status(200).json({ message: 'Email cleared successfully', email: data.Attributes });
+    } catch (error) {
+        console.error('Error clearing email in DynamoDB:', error);
+        res.status(500).json({ error: 'Error clearing email', details: error.message, stack: error.stack });
+    }
+});
+
+// Add a simple test route
+app.get('/test', (req, res) => {
+  res.json({ message: 'Server is running' });
+});
+
+// Add this new route to handle POST requests to /email
+app.post('/email', async (req, res) => {
+  console.log('Received POST request to /email');
+  console.log('Request body:', req.body);
+
+  try {
+    const params = {
+      TableName: 'email_queue',
+      Item: {
+        id: Date.now().toString(), // Use timestamp as a unique ID
+        subject: req.body.subject,
+        from: req.body.from,
+        timestamp: req.body.timestamp,
+        body: req.body.body,
+        user: req.body.user,
+        status: req.body.status,
+        messageId: req.body.messageId,
+        emailTimestamp: req.body.timestamp // Use this as the primary key
+      }
+    };
+
+    await dynamoDB.put(params).promise();
+    console.log('Email saved successfully');
+    res.status(200).json({ message: 'Email saved successfully' });
+  } catch (error) {
+    console.error('Error saving email to DynamoDB:', error);
+    res.status(500).json({ error: 'Error saving email', details: error.message });
+  }
+});
+
+// Use the ID of your existing assistant
+const assistantId = process.env.OPENAI_ASSISTANT_ID;
+
+// Add the OpenAI chat endpoint
+app.post('/api/chat', async (req, res) => {
+  try {
+    const { content, emailId } = req.body;
+
+    // Create a thread
+    const thread = await openai.beta.threads.create();
+
+    // Add a message to the thread
+    await openai.beta.threads.messages.create(thread.id, {
+      role: "user",
+      content: content
+    });
+
+    // Run the assistant
+    const run = await openai.beta.threads.runs.create(thread.id, {
+      assistant_id: assistantId,
+      instructions: "Please respond in JSON format."
+    });
+
+    // Wait for the run to complete
+    let runStatus = await openai.beta.threads.runs.retrieve(thread.id, run.id);
+    while (runStatus.status !== "completed") {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      runStatus = await openai.beta.threads.runs.retrieve(thread.id, run.id);
+    }
+
+    // Retrieve the messages
+    const messages = await openai.beta.threads.messages.list(thread.id);
+
+    // Get the last message from the assistant
+    const lastMessage = messages.data
+      .filter(message => message.role === "assistant")
+      .pop();
+
+    if (lastMessage) {
+      // Assuming the assistant's response is in JSON format
+      const jsonResponse = JSON.parse(lastMessage.content[0].text.value);
+
+      // Update the DynamoDB table with the assistant's response
+      const params = {
+        TableName: process.env.DYNAMODB_TABLE_NAME,
+        Key: { id: emailId },
+        UpdateExpression: 'set assistantResponse = :r',
+        ExpressionAttributeValues: {
+          ':r': jsonResponse,
+        },
+      };
+
+      await dynamoDB.update(params).promise();
+
+      res.json(jsonResponse);
+    } else {
+      res.status(404).json({ error: 'No response from assistant.' });
+    }
+  } catch (error) {
+    console.error('Error processing chat:', error);
+    res.status(500).json({ error: 'An error occurred while processing the chat.' });
+  }
+});
+
+checkTableExists().then(() => {
+  app.listen(port, '0.0.0.0', () => {
     console.log(`Server running on port ${port}`);
   });
-
-  server.on('error', (error) => {
-    console.error('Server error:', error);
-  });
-}
-
-// Call startServer instead of directly calling server.listen
-startServer();
-
-// Middleware to log requests
-app.use((req, res, next) => {
-  console.log(`Received ${req.method} request on ${req.path}`);
-  next();
+}).catch(error => {
+  console.error('Failed to start server:', error);
 });
