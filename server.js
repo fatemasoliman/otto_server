@@ -315,6 +315,12 @@ app.post('/api/chat', async (req, res) => {
   }
 });
 
+// Add this new route near the other route definitions
+app.get('/health', (req, res) => {
+  console.log('Received GET request to /health');
+  res.status(200).json({ status: 'healthy', message: 'Server is running' });
+});
+
 checkTableExists().then(() => {
   app.listen(port, '0.0.0.0', () => {
     console.log(`Server running on port ${port}`);
