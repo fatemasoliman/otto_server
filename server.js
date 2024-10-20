@@ -6,9 +6,7 @@ const AWS = require('aws-sdk');
 const cors = require('cors');
 const fs = require('fs');
 const util = require('util');
-const OpenAI = require('openai');
 const mysql = require('mysql2/promise');
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // Set up logging
 const log_file = fs.createWriteStream('/home/ec2-user/ottoq-app/debug.log', {flags : 'a'});
@@ -248,70 +246,6 @@ app.post('/email', async (req, res) => {
   } catch (error) {
     console.error('Error saving email to DynamoDB:', error);
     res.status(500).json({ error: 'Error saving email', details: error.message });
-  }
-});
-
-// Use the ID of your existing assistant
-const assistantId = process.env.OPENAI_ASSISTANT_ID;
-
-// Add the OpenAI chat endpoint
-app.post('/api/chat', async (req, res) => {
-  try {
-    const { content, emailId } = req.body;
-
-    // Create a thread
-    const thread = await openai.beta.threads.create();
-
-    // Add a message to the thread
-    await openai.beta.threads.messages.create(thread.id, {
-      role: "user",
-      content: content
-    });
-
-    // Run the assistant
-    const run = await openai.beta.threads.runs.create(thread.id, {
-      assistant_id: assistantId,
-      instructions: "Please respond in JSON format."
-    });
-
-    // Wait for the run to complete
-    let runStatus = await openai.beta.threads.runs.retrieve(thread.id, run.id);
-    while (runStatus.status !== "completed") {
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      runStatus = await openai.beta.threads.runs.retrieve(thread.id, run.id);
-    }
-
-    // Retrieve the messages
-    const messages = await openai.beta.threads.messages.list(thread.id);
-
-    // Get the last message from the assistant
-    const lastMessage = messages.data
-      .filter(message => message.role === "assistant")
-      .pop();
-
-    if (lastMessage) {
-      // Assuming the assistant's response is in JSON format
-      const jsonResponse = JSON.parse(lastMessage.content[0].text.value);
-
-      // Update the DynamoDB table with the assistant's response
-      const params = {
-        TableName: process.env.DYNAMODB_TABLE_NAME,
-        Key: { id: emailId },
-        UpdateExpression: 'set assistantResponse = :r',
-        ExpressionAttributeValues: {
-          ':r': jsonResponse,
-        },
-      };
-
-      await dynamoDB.update(params).promise();
-
-      res.json(jsonResponse);
-    } else {
-      res.status(404).json({ error: 'No response from assistant.' });
-    }
-  } catch (error) {
-    console.error('Error processing chat:', error);
-    res.status(500).json({ error: 'An error occurred while processing the chat.' });
   }
 });
 
