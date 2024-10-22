@@ -9,7 +9,7 @@ const util = require('util');
 const mysql = require('mysql2/promise');
 
 // Set up logging
-const log_file = fs.createWriteStream('/home/ec2-user/ottoq-app/debug.log', {flags : 'a'});
+const log_file = fs.createWriteStream('/home/ec2-user/ottoq-server/debug.log', {flags : 'a'});
 const log_stdout = process.stdout;
 
 console.log = function(d) {
